@@ -1,0 +1,1594 @@
+#!/usr/bin/env python3
+"""blockcheck - is a domain (or *.wildcard) actually blocked?
+
+Stdlib only, no dig/host required: ships its own DNS client. Probes four
+independent layers and tells you *where* the block happens, not just that
+something failed:
+
+  dns     local resolver vs public resolvers vs DoH vs authoritative NS
+          (NXDOMAIN, SERVFAIL, REFUSED, NODATA, sinkhole 0.0.0.0/loopback,
+           private-IP rewrite, silent drop, transparent interception)
+  cname   full CNAME chain, cross-domain hops, known tracker/vendor targets,
+          first-party CNAME cloaking, and CNAME targets that are themselves
+          blocked (a classic "site hangs for 30s" cause)
+  tcp/tls TCP connect + TLS handshake per address with SNI: distinguishes an
+          IP/port block from SNI-based filtering from a MITM/block portal
+  http    block-page fingerprinting when TLS fails or DNS is sinkholed
+
+Examples
+  blockcheck example.com
+  blockcheck '*.doubleclick.net'
+  blockcheck example.com -v --auth --asn
+  blockcheck -f domains.txt --json > report.json
+  blockcheck ads.site.com --resolver 192.168.31.1:53 --timeout 3
+  blockcheck '*.example.com' --samples 5 --brief
+
+Exit codes: 0 allowed, 2 blocked, 3 partial/unknown, 1 error.
+"""
+
+import argparse
+import ipaddress
+import json
+import os
+import random
+import re
+import shutil
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+VERSION = "1.0"
+
+# --------------------------------------------------------------------------- #
+# constants
+# --------------------------------------------------------------------------- #
+
+QT = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT",
+      28: "AAAA", 33: "SRV", 35: "NAPTR", 39: "DNAME", 41: "OPT", 43: "DS",
+      46: "RRSIG", 47: "NSEC", 48: "DNSKEY", 52: "TLSA", 64: "SVCB",
+      65: "HTTPS", 257: "CAA"}
+
+RCODE = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN",
+         4: "NOTIMP", 5: "REFUSED", 6: "YXDOMAIN", 7: "YXRRSET",
+         8: "NXRRSET", 9: "NOTAUTH", 10: "NOTZONE"}
+
+SINKHOLE_NETS = [ipaddress.ip_network(n) for n in
+                 ("0.0.0.0/8", "127.0.0.0/8", "::/128", "::1/128")]
+BLOCKPAGE_NETS = [ipaddress.ip_network(n) for n in
+                  ("146.112.61.0/24", "89.234.157.254/32")]
+NONPUBLIC_NETS = [ipaddress.ip_network(n) for n in
+                  ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                   "100.64.0.0/10", "169.254.0.0/16", "192.0.2.0/24",
+                   "198.18.0.0/15", "fc00::/7", "fe80::/10")]
+
+# well-known ad / analytics / tag-manager hostnames, used to spot cloaking
+TRACKERS = {
+    "doubleclick.net": "Google DoubleClick", "google-analytics.com": "Google Analytics",
+    "googletagmanager.com": "Google Tag Manager", "googleadservices.com": "Google Ads",
+    "adservice.google.com": "Google Ads", "2mdn.net": "Google DoubleClick",
+    "adobedc.net": "Adobe Experience Cloud", "omtrdc.net": "Adobe Analytics",
+    "2o7.net": "Adobe Analytics", "demdex.net": "Adobe Audience Manager",
+    "everesttech.net": "Adobe Advertising", "at-o.net": "AT Internet",
+    "igodigital.com": "Salesforce Marketing Cloud", "exacttarget.com": "Salesforce",
+    "pardot.com": "Salesforce Pardot", "hs-scripts.com": "HubSpot",
+    "hubspot.com": "HubSpot", "hsforms.net": "HubSpot", "marketo.com": "Marketo",
+    "mktoresp.com": "Marketo", "eloqua.com": "Oracle Eloqua", "en25.com": "Oracle Eloqua",
+    "tealiumiq.com": "Tealium", "tiqcdn.com": "Tealium", "criteo.com": "Criteo",
+    "criteo.net": "Criteo", "matomo.cloud": "Matomo", "segment.io": "Segment",
+    "segment.com": "Segment", "adsrvr.org": "The Trade Desk", "adnxs.com": "AppNexus/Xandr",
+    "amazon-adsystem.com": "Amazon Ads", "scorecardresearch.com": "Comscore",
+    "quantserve.com": "Quantcast", "bluekai.com": "Oracle BlueKai", "krxd.net": "Salesforce Krux",
+    "exelator.com": "Nielsen", "tapad.com": "Tapad", "crwdcntrl.net": "Lotame",
+    "agkn.com": "Neustar", "rlcdn.com": "LiveRamp", "liadm.com": "LiveRamp",
+    "zeotap.com": "Zeotap", "id5-sync.com": "ID5", "adsymptotic.com": "Drawbridge",
+    "sitescout.com": "Centro", "tribalfusion.com": "Exponential", "casalemedia.com": "Index Exchange",
+    "pubmatic.com": "PubMatic", "rubiconproject.com": "Magnite", "openx.net": "OpenX",
+    "indexww.com": "Index Exchange", "33across.com": "33Across", "sharethrough.com": "Sharethrough",
+    "smartadserver.com": "Equativ", "adform.net": "Adform", "1rx.io": "RhythmOne",
+    "moatads.com": "Oracle Moat", "doubleverify.com": "DoubleVerify",
+    "adsafeprotected.com": "Integral Ad Science", "serving-sys.com": "Sizmek",
+    "flashtalking.com": "Flashtalking", "turn.com": "Amobee", "bidswitch.net": "BidSwitch",
+    "yieldmo.com": "Yieldmo", "gumgum.com": "GumGum", "spotxchange.com": "SpotX",
+    "teads.tv": "Teads", "onetrust.com": "OneTrust", "cookielaw.org": "OneTrust",
+    "cookiebot.com": "Cookiebot", "usercentrics.eu": "Usercentrics",
+    "consensu.org": "IAB TCF", "kinesisct.com": "Kinesis", "kissmetrics.com": "Kissmetrics",
+    "heapanalytics.com": "Heap", "mixpanel.com": "Mixpanel", "amplitude.com": "Amplitude",
+    "hotjar.com": "Hotjar", "fullstory.com": "FullStory", "clarity.ms": "Microsoft Clarity",
+    "newrelic.com": "New Relic", "nr-data.net": "New Relic", "bugsnag.com": "Bugsnag",
+    "sentry.io": "Sentry", "datadoghq.com": "Datadog", "optimizely.com": "Optimizely",
+    "vwo.com": "VWO", "abtasty.com": "AB Tasty", "chartbeat.com": "Chartbeat",
+    "parsely.com": "Parse.ly", "outbrain.com": "Outbrain", "taboola.com": "Taboola",
+    "cquotient.com": "Cquotient", "bluecore.com": "Bluecore", "exponea.com": "Exponea",
+    "emarsys.net": "Emarsys", "listrak.com": "Listrak", "bronto.com": "Bronto",
+    "klaviyo.com": "Klaviyo", "braze.com": "Braze", "iterable.com": "Iterable",
+    "customer.io": "Customer.io", "moengage.com": "MoEngage", "clevertap.com": "CleverTap",
+    "appsflyer.com": "AppsFlyer", "adjust.com": "Adjust", "branch.io": "Branch",
+    "kochava.com": "Kochava", "singular.net": "Singular", "tune.com": "Tune",
+}
+
+# infrastructure that is *expected* to appear in CNAME chains (not cloaking)
+CDN_SUFFIX = (
+    "cloudflare.net", "cloudfront.net", "akamaiedge.net", "edgekey.net",
+    "edgesuite.net", "akamai.net", "akamaitechnologies.com", "fastly.net",
+    "fastlylb.net", "azureedge.net", "trafficmanager.net", "azurefd.net",
+    "stackpathdns.com", "cdn77.org", "b-cdn.net", "kxcdn.com", "llnwd.net",
+    "netlify.app", "netlify.com", "vercel-dns.com", "herokudns.com",
+    "pantheonsite.io", "wpengine.com", "squarespace.com", "shopifycdn.com",
+    "myshopify.com", "impervadns.net", "incapdns.net", "sucuri.net",
+    "googlehosted.com", "ghs.googlehosted.com", "1e100.net", "googleusercontent.com",
+    "amazonaws.com", "elb.amazonaws.com", "cloudapp.azure.com",
+)
+
+MULTI_SUFFIX = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk",
+    "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "co.kr", "or.kr", "co.in",
+    "net.in", "org.in", "co.za", "org.za", "com.au", "net.au", "org.au", "edu.au",
+    "gov.au", "co.nz", "net.nz", "org.nz", "com.br", "net.br", "org.br",
+    "com.cn", "net.cn", "org.cn", "gov.cn", "com.tw", "org.tw", "com.hk",
+    "com.sg", "com.my", "com.ph", "com.vn", "co.id", "or.id", "co.th", "in.th",
+    "com.mx", "com.ar", "com.co", "com.pe", "com.ve", "com.ec", "com.uy",
+    "com.py", "com.bo", "com.do", "com.gt", "com.sv", "com.hn", "com.ni",
+    "com.pa", "com.cr", "com.tr", "com.ua", "com.pl", "com.ru", "com.es",
+    "com.eg", "com.sa", "com.ng", "co.ke", "co.il", "com.pk", "com.bd",
+    "co.ve", "com.cy", "com.mt", "com.gr", "com.pt", "com.ro", "com.hr",
+    "com.lb", "com.jo", "com.kw", "com.qa", "com.om", "com.bh", "co.ma",
+    "co.tz", "co.ug", "co.zw", "com.gh", "com.np", "com.lk", "com.mm",
+    "com.kh", "com.la", "co.uz", "com.az", "com.ge", "com.am", "com.by",
+    "com.kz", "com.tj", "com.kg", "com.md", "com.al", "com.mk", "com.ba",
+}
+
+BLOCKPAGE_MARKERS = (
+    "fortiguard", "sophos", "palo alto", "blocked", "block page", "blockpage",
+    "access denied", "not allowed", "restricted", "opendns", "umbrella",
+    "adguard", "pi-hole", "pihole", "untangle", "barracuda", "forcepoint",
+    "websense", "zscaler", "sonicwall", "sangfor", "netsweeper", "lightspeed",
+    "content filter", "dnsfilter", "nextdns", "controld", "categor",
+    "this site has been blocked", "website is blocked", "security policy",
+)
+
+# --------------------------------------------------------------------------- #
+# tiny terminal helpers
+# --------------------------------------------------------------------------- #
+
+class C:
+    on = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+    @classmethod
+    def _w(cls, s, code):
+        return f"\033[{code}m{s}\033[0m" if cls.on else str(s)
+
+    @classmethod
+    def bold(cls, s): return cls._w(s, "1")
+    @classmethod
+    def dim(cls, s): return cls._w(s, "2")
+    @classmethod
+    def red(cls, s): return cls._w(s, "31;1")
+    @classmethod
+    def green(cls, s): return cls._w(s, "32;1")
+    @classmethod
+    def yellow(cls, s): return cls._w(s, "33;1")
+    @classmethod
+    def cyan(cls, s): return cls._w(s, "36")
+    @classmethod
+    def mag(cls, s): return cls._w(s, "35")
+
+
+def dur(seconds):
+    """Format a duration (already elapsed), not a timestamp."""
+    try:
+        return f"{int(round(float(seconds) * 1000))} ms"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def trunc(s, n):
+    s = str(s)
+    return s if len(s) <= n else s[: n - 1] + "\u2026"
+
+
+# --------------------------------------------------------------------------- #
+# DNS client
+# --------------------------------------------------------------------------- #
+
+class DNSError(Exception):
+    pass
+
+
+def parse_server(spec):
+    if isinstance(spec, tuple):
+        return spec
+    spec = spec.strip()
+    if spec.startswith("["):
+        host, _, rest = spec[1:].partition("]")
+        port = int(rest[1:]) if rest.startswith(":") else 53
+        return host, port
+    if spec.count(":") == 1:
+        host, port = spec.split(":")
+        return host, int(port)
+    return spec, 53
+
+
+def _encode_name(name):
+    out = b""
+    for label in name.rstrip(".").split("."):
+        if not label:
+            continue
+        try:
+            b = label.encode("idna")
+        except UnicodeError:
+            b = label.encode("ascii", "replace")
+        if len(b) > 63:
+            raise DNSError(f"label too long: {label}")
+        out += bytes([len(b)]) + b
+    return out + b"\x00"
+
+
+def _read_name(buf, off):
+    labels, jumped, orig, seen = [], False, None, set()
+    while True:
+        if off >= len(buf):
+            raise DNSError("truncated name")
+        ln = buf[off]
+        if ln == 0:
+            off += 1
+            break
+        if ln & 0xC0 == 0xC0:
+            if off + 1 >= len(buf):
+                raise DNSError("truncated pointer")
+            ptr = struct.unpack("!H", buf[off:off + 2])[0] & 0x3FFF
+            if orig is None:
+                orig = off + 2
+            if ptr in seen:
+                raise DNSError("compression loop")
+            seen.add(ptr)
+            off, jumped = ptr, True
+            continue
+        off += 1
+        labels.append(buf[off:off + ln].decode("ascii", "replace"))
+        off += ln
+    return ".".join(labels), (orig if jumped else off)
+
+
+def _fmt_rdata(buf, rtype, rd, off):
+    """Best-effort human form of RDATA. off = absolute offset of rd in buf."""
+    try:
+        if rtype == 1 and len(rd) == 4:
+            return socket.inet_ntop(socket.AF_INET, rd)
+        if rtype == 28 and len(rd) == 16:
+            return socket.inet_ntop(socket.AF_INET6, rd)
+        if rtype in (2, 5, 12, 39):
+            return _read_name(buf, off)[0]
+        if rtype == 6:
+            m, o2 = _read_name(buf, off)
+            r, o3 = _read_name(buf, o2)
+            serial = struct.unpack("!I", buf[o3:o3 + 4])[0]
+            return f"{m} {r} serial={serial}"
+        if rtype == 15:
+            pref = struct.unpack("!H", rd[:2])[0]
+            return f"{pref} {_read_name(buf, off + 2)[0]}"
+        if rtype == 16:
+            parts, i = [], 0
+            while i < len(rd):
+                ln = rd[i]
+                parts.append(rd[i + 1:i + 1 + ln].decode("utf-8", "replace"))
+                i += 1 + ln
+            return '"' + '" "'.join(parts) + '"'
+        if rtype in (64, 65):
+            prio = struct.unpack("!H", rd[:2])[0]
+            target, o = _read_name(buf, off + 2)
+            params = ""
+            while o + 4 <= off + len(rd):
+                k, ln = struct.unpack("!HH", buf[o:o + 4])
+                val = buf[o + 4:o + 4 + ln]
+                params += f" key{k}=" + val.hex()
+                o += 4 + ln
+            return f"{prio} {target}{params}"
+        if rtype == 257:
+            fl = struct.unpack("!B", rd[:1])[0]
+            tag = rd[2:2 + rd[1]].decode("ascii", "replace")
+            return f'{fl} {tag} "{rd[3 + rd[1]:].decode("ascii", "replace")}"'
+        if rtype == 33:
+            pr, wt, po = struct.unpack("!HHH", rd[:6])
+            return f"{pr} {wt} {po} {_read_name(buf, off + 6)[0]}"
+        if rtype == 46:
+            return f"RRSIG type={struct.unpack('!H', rd[:2])[0]}"
+        if rtype == 43:
+            return f"DS keytag={struct.unpack('!H', rd[:2])[0]}"
+    except Exception:
+        pass
+    return rd.hex() if len(rd) <= 24 else rd[:24].hex() + "..."
+
+
+def _parse(buf):
+    if len(buf) < 12:
+        raise DNSError("short message")
+    tid, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", buf[:12])
+    rcode = flags & 0xF
+    msg = {"id": tid, "flags": flags, "rcode": rcode, "qd": qd,
+           "aa": bool(flags & 0x0400), "tc": bool(flags & 0x0200),
+           "ra": bool(flags & 0x0080), "ad": bool(flags & 0x0020),
+           "questions": [], "answer": [], "authority": [], "additional": []}
+    off = 12
+    for _ in range(qd):
+        n, off = _read_name(buf, off)
+        qt, qc = struct.unpack("!HH", buf[off:off + 4])
+        off += 4
+        msg["questions"].append((n, qt))
+
+    def section(count):
+        nonlocal off
+        out = []
+        for _ in range(count):
+            n, off = _read_name(buf, off)
+            rt, rc, ttl, rdl = struct.unpack("!HHIH", buf[off:off + 10])
+            off += 10
+            rd_off = off
+            rd = buf[off:off + rdl]
+            off += rdl
+            if rt == 41:  # OPT: extended rcode
+                msg["rcode"] |= ((ttl >> 24) & 0xFF) << 4
+                continue
+            out.append({"name": n, "type": rt, "type_name": QT.get(rt, str(rt)),
+                        "ttl": ttl, "data": _fmt_rdata(buf, rt, rd, rd_off)})
+        return out
+
+    msg["answer"] = section(an)
+    msg["authority"] = section(ns)
+    msg["additional"] = section(ar)
+    return msg
+
+
+def _udp(buf, tid, server, timeout):
+    host, port = server
+    fam = socket.AF_INET6 if ":" in host else socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(buf, (host, port))
+        deadline = time.time() + timeout
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                raise socket.timeout()
+            s.settimeout(left)
+            data, _ = s.recvfrom(4096)
+            if len(data) >= 2 and struct.unpack("!H", data[:2])[0] == tid:
+                return data
+    finally:
+        s.close()
+
+
+def _tcp(buf, tid, server, timeout):
+    host, port = server
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        s.settimeout(timeout)
+        s.sendall(struct.pack("!H", len(buf)) + buf)
+        hdr = s.recv(2)
+        if len(hdr) < 2:
+            raise DNSError("short TCP reply")
+        want = struct.unpack("!H", hdr)[0]
+        data = b""
+        while len(data) < want:
+            chunk = s.recv(want - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+
+def dns_query(name, qtype, server, timeout=4.0, rd=True, dnssec=True,
+              force_tcp=False, retries=1):
+    """Return dict(server, qtype, rcode, answer[], authority[], elapsed, ...)."""
+    srv = parse_server(server) if isinstance(server, str) else server
+    tid = random.randint(0, 0xFFFF)
+    hdr = struct.pack("!HHHHHH", tid, 0x0100 if rd else 0x0000, 1, 0, 0, 1 if dnssec else 0)
+    q = _encode_name(name) + struct.pack("!HH", qtype, 1)
+    opt = b"\x00" + struct.pack("!HHIH", 41, 1232, 0, 0x8000) if dnssec else b""
+    buf = hdr + q + opt
+    t0 = time.time()
+    last = None
+    for attempt in range(max(1, retries)):
+        try:
+            if force_tcp:
+                raw = _tcp(buf, tid, srv, timeout)
+            else:
+                raw = _udp(buf, tid, srv, timeout)
+                if len(raw) > 12 and struct.unpack("!H", raw[2:4])[0] & 0x0200:
+                    raw = _tcp(buf, tid, srv, timeout)  # truncated -> TCP
+            msg = _parse(raw)
+            msg.update({"server": srv[0], "port": srv[1],
+                        "qtype": qtype, "qtype_name": QT.get(qtype, str(qtype)),
+                        "elapsed": time.time() - t0, "error": None,
+                        "proto": "tcp" if force_tcp else "udp"})
+            return msg
+        except Exception as e:
+            last = e
+    raise DNSError(f"{type(last).__name__}: {last}")
+
+
+def _q(name, qtype, server, opts, **kw):
+    """dns_query wrapper returning an error-record instead of raising."""
+    t0 = time.time()
+    try:
+        r = dns_query(name, qtype, server, timeout=opts.timeout,
+                      retries=opts.retries, dnssec=opts.dnssec, **kw)
+        return r
+    except Exception as e:
+        return {"server": parse_server(server)[0], "port": parse_server(server)[1],
+                "qtype": qtype, "qtype_name": QT.get(qtype, str(qtype)),
+                "rcode": None, "answer": [], "authority": [], "additional": [],
+                "elapsed": time.time() - t0, "error": str(e), "aa": False,
+                "ad": False, "questions": []}
+
+
+def ips_of(msg, qtype=None):
+    out = []
+    for rr in msg.get("answer", []):
+        if rr["type"] in (1, 28) and (qtype is None or rr["type"] == qtype):
+            out.append(rr["data"])
+    return out
+
+
+def cname_chain(msg):
+    """Follow CNAME/DNAME records from the qname; returns list of hops."""
+    qname = msg["questions"][0][0].rstrip(".").lower() if msg.get("questions") else ""
+    chain, cur, guard = [], qname, 0
+    while guard < 16:
+        guard += 1
+        nxt = None
+        for rr in msg.get("answer", []):
+            if rr["type"] in (5, 39) and rr["name"].rstrip(".").lower() == cur:
+                nxt = rr["data"].rstrip(".").lower()
+                break
+        if not nxt or nxt == cur:
+            break
+        chain.append((cur, nxt))
+        cur = nxt
+    return chain
+
+
+# --------------------------------------------------------------------------- #
+# DoH
+# --------------------------------------------------------------------------- #
+
+def doh_query(name, qtype, opts, provider=None):
+    providers = [("cloudflare", "https://cloudflare-dns.com/dns-query"),
+                 ("google", "https://dns.google/resolve")]
+    if provider:
+        providers = [p for p in providers if p[0] == provider] or providers
+    t0 = time.time()
+    err = None
+    for pname, base in providers:
+        url = f"{base}?name={name}&type={QT.get(qtype, 'A')}&ct=application/dns-json"
+        try:
+            out = subprocess.run(
+                ["curl", "-sS", "--max-time", str(max(3, opts.timeout)),
+                 "-H", "accept: application/dns-json", url],
+                capture_output=True, text=True, timeout=opts.timeout + 3)
+            if out.returncode != 0:
+                err = out.stderr.strip()[:120]
+                continue
+            js = json.loads(out.stdout)
+            ans = []
+            for a in js.get("Answer", []):
+                t = a.get("type", 0)
+                ans.append({"name": a.get("name", name), "type": t,
+                            "type_name": QT.get(t, str(t)), "ttl": a.get("TTL", 0),
+                            "data": a.get("data", "")})
+            return {"server": pname, "port": 443, "qtype": qtype,
+                    "qtype_name": QT.get(qtype, "A"), "rcode": js.get("Status", 0),
+                    "answer": ans, "authority": [], "additional": [],
+                    "elapsed": time.time() - t0, "error": None,
+                    "aa": False, "ad": bool(js.get("AD")),
+                    "questions": [(name, qtype)], "proto": "doh"}
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+    return {"server": provider or "doh", "port": 443, "qtype": qtype,
+            "qtype_name": QT.get(qtype, "A"), "rcode": None, "answer": [],
+            "authority": [], "additional": [], "elapsed": time.time() - t0,
+            "error": err, "aa": False, "ad": False, "questions": [(name, qtype)],
+            "proto": "doh"}
+
+
+# --------------------------------------------------------------------------- #
+# classification helpers
+# --------------------------------------------------------------------------- #
+
+NAT64_NETS = [ipaddress.ip_network(n) for n in ("64:ff9b::/96", "64:ff9b:1::/48")]
+
+
+def is_nat64(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(a in n for n in NAT64_NETS)
+
+
+def ip_kind(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return "invalid"
+    if any(a in n for n in SINKHOLE_NETS):
+        return "sinkhole"
+    if any(a in n for n in BLOCKPAGE_NETS):
+        return "blockpage"
+    if any(a in n for n in NONPUBLIC_NETS):
+        return "private"
+    return "public"
+
+
+_PSL = None
+
+
+def _load_psl():
+    global _PSL
+    if _PSL is not None:
+        return _PSL
+    _PSL = set()
+    for p in ("/usr/share/publicsuffix/public_suffix_list.dat",
+              "/usr/share/publicsuffix/effective_tld_names.dat",
+              "/etc/public_suffix_list.dat"):
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("//"):
+                        _PSL.add(line.lstrip("!").lower())
+            if _PSL:
+                break
+        except OSError:
+            continue
+    return _PSL
+
+
+def registrable(domain):
+    """eTLD+1, best effort (uses system PSL when present)."""
+    d = domain.rstrip(".").lower()
+    labels = d.split(".")
+    if len(labels) <= 2:
+        return d
+    psl = _load_psl()
+    for i in range(len(labels)):
+        cand = ".".join(labels[i:])
+        if cand in psl or cand in MULTI_SUFFIX:
+            keep = len(labels) - i + 1
+            return ".".join(labels[-keep:])
+    return ".".join(labels[-2:])
+
+
+def tracker_of(domain):
+    d = domain.rstrip(".").lower()
+    for t, vendor in TRACKERS.items():
+        if d == t or d.endswith("." + t):
+            return vendor
+    return None
+
+
+def is_cdn(domain):
+    d = domain.rstrip(".").lower()
+    return any(d == c or d.endswith("." + c) for c in CDN_SUFFIX)
+
+
+def classify_dns(res, truth):
+    """-> (class, note). class in ok|nxdomain|servfail|refused|nodata|sinkhole|
+    blockpage|private|dropped|error|differs|nonexistent"""
+    qt = res.get("qtype")
+    byq = (truth.get("by_qtype") or {}).get(qt)
+    if byq is not None:
+        t_ok, t_ips, t_rcode = byq["ok"], byq["ips"], byq["rcode"]
+    else:
+        t_ok, t_ips, t_rcode = truth.get("ok"), truth.get("ips", []), truth.get("rcode")
+    if res.get("error"):
+        if t_ok:
+            return "dropped", f"no response ({res['error'].split(':')[0]}) while public resolvers answer"
+        return "error", res["error"]
+    rc = res.get("rcode")
+    ips = ips_of(res)
+    kinds = {ip_kind(i) for i in ips}
+    if rc == 3:
+        if t_ok:
+            return "nxdomain", "NXDOMAIN while public resolvers return an answer"
+        return "nonexistent", "NXDOMAIN everywhere (name does not exist)"
+    if rc == 2:
+        return "servfail", "SERVFAIL (filter/upstream failure, not a normal answer)"
+    if rc == 5:
+        return "refused", "REFUSED by resolver"
+    if rc not in (0, None):
+        return "servfail", f"{RCODE.get(rc, rc)} from resolver"
+    if "sinkhole" in kinds:
+        return "sinkhole", f"answers sinkhole address {', '.join(ips)}"
+    if "blockpage" in kinds:
+        return "blockpage", f"answers known block-page address {', '.join(ips)}"
+    if not ips:
+        if t_ok:
+            return "nodata", "NOERROR but empty answer (NODATA/RPZ) while public resolvers answer"
+        return "empty", "NOERROR with no address records (same as public DNS)"
+    if qt == 28 and ips and all(is_nat64(i) for i in ips):
+        return "nat64", "synthesized NAT64 address (this network translates IPv6)"
+    if kinds == {"private"} and t_ok and {ip_kind(i) for i in t_ips} == {"public"}:
+        return "private", f"answers non-public address {', '.join(ips)} (sinkhole or split-horizon)"
+    if t_ok and t_ips and set(ips) != set(t_ips):
+        return "differs", "answer differs from public DNS (CDN geo-DNS is normal)"
+    return "ok", ""
+
+
+BLOCKING_CLASSES = {"nxdomain", "servfail", "refused", "nodata", "sinkhole",
+                    "blockpage", "private", "dropped"}
+
+
+# --------------------------------------------------------------------------- #
+# network probes
+# --------------------------------------------------------------------------- #
+
+def ipv6_routable(opts):
+    """Can we actually reach IPv6? (proot phones often blackhole it)"""
+    if getattr(opts, "_v6", None) is None:
+        opts._v6 = tcp_probe("2606:4700:4700::1111", 443,
+                             min(2.5, opts.timeout))["ok"]
+    return opts._v6
+
+
+def tcp_probe(ip, port, timeout):
+    t0 = time.time()
+    fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((ip, port))
+        return {"ok": True, "elapsed": time.time() - t0, "error": None}
+    except socket.timeout:
+        return {"ok": False, "elapsed": time.time() - t0, "error": "timeout",
+                "kind": "timeout"}
+    except ConnectionResetError:
+        return {"ok": False, "elapsed": time.time() - t0, "error": "connection reset",
+                "kind": "reset"}
+    except ConnectionRefusedError:
+        return {"ok": False, "elapsed": time.time() - t0, "error": "refused",
+                "kind": "refused"}
+    except OSError as e:
+        return {"ok": False, "elapsed": time.time() - t0, "error": str(e),
+                "kind": "oserror"}
+    finally:
+        s.close()
+
+
+def _cert_via_openssl(der):
+    try:
+        pem = ssl.DER_cert_to_PEM_cert(der)
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
+            f.write(pem)
+            path = f.name
+        try:
+            out = subprocess.run(
+                ["openssl", "x509", "-noout", "-subject", "-issuer", "-enddate",
+                 "-ext", "subjectAltName"],
+                stdin=open(path, "rb"), capture_output=True, text=True, timeout=8)
+            txt = out.stdout
+        finally:
+            os.unlink(path)
+        info = {}
+        for line in txt.splitlines():
+            line = line.strip()
+            if line.startswith("subject="):
+                info["subject"] = line[8:].strip()
+            elif line.startswith("issuer="):
+                info["issuer"] = line[7:].strip()
+            elif line.startswith("notAfter="):
+                info["not_after"] = line[9:].strip()
+            elif line.startswith("DNS:"):
+                info["san"] = [x.strip()[4:] for x in line.split(",") if x.strip().startswith("DNS:")]
+        return info
+    except Exception:
+        return {}
+
+
+def tls_probe(ip, sni, port, timeout):
+    """Full TCP+TLS probe; separates IP-level from SNI-level blocking."""
+    res = {"ip": ip, "port": port, "sni": sni}
+    tcp = tcp_probe(ip, port, timeout)
+    res["tcp"] = tcp
+    if not tcp["ok"]:
+        res["status"] = "tcp_fail"
+        return res
+    ctx = ssl.create_default_context()
+    try:
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+    except Exception:
+        pass
+    t0 = time.time()
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=sni) as ss:
+                cert = ss.getpeercert()
+                res.update({"status": "ok", "elapsed": time.time() - t0,
+                            "tls": ss.version(),
+                            "alpn": ss.selected_alpn_protocol(),
+                            "cipher": (ss.cipher()[0] if ss.cipher() else None),
+                            "cert_subject": _cn(cert),
+                            "cert_issuer": _issuer(cert),
+                            "cert_san": [v for k, v in cert.get("subjectAltName", ()) if k == "DNS"],
+                            "not_after": cert.get("notAfter")})
+        return res
+    except ssl.SSLCertVerificationError as e:
+        # handshake may still complete: retry unverified to distinguish
+        verr = str(e).lower()
+        if "expired" in verr:
+            res["status"] = "cert_expired"
+        elif "hostname mismatch" in verr or "not valid for" in verr or "doesn't match" in verr:
+            res["status"] = "cert_mismatch"
+        else:
+            res["status"] = "cert_untrusted"
+        res["verify_error"] = str(e)
+        try:
+            c2 = ssl.create_default_context()
+            c2.check_hostname = False
+            c2.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((ip, port), timeout=timeout) as raw:
+                with c2.wrap_socket(raw, server_hostname=sni) as ss:
+                    der = ss.getpeercert(binary_form=True)
+                    res["tls"] = ss.version()
+                    res.update(_cert_via_openssl(der))
+                    if cert_matches(sni, res) is False:
+                        res["status"] = "cert_mismatch"
+                        res["cert_for"] = ", ".join(dict.fromkeys(_cert_names(res)))[:80]
+        except Exception:
+            pass
+        return res
+    except (ssl.SSLEOFError, ssl.SSLZeroReturnError, ConnectionResetError) as e:
+        res.update({"status": "tls_reset", "error": f"{type(e).__name__}: {e}"})
+        return res
+    except socket.timeout:
+        res.update({"status": "tls_timeout", "error": "timeout during handshake"})
+        return res
+    except ssl.SSLError as e:
+        res.update({"status": "tls_fail", "error": str(e)})
+        return res
+    except OSError as e:
+        res.update({"status": "tls_fail", "error": str(e)})
+        return res
+
+
+def _cert_names(info):
+    names = list(info.get("san") or [])
+    m = re.search(r"CN\s*=\s*([^,/]+)", info.get("subject") or "")
+    if m:
+        names.append(m.group(1).strip())
+    return [n.lower().rstrip(".") for n in names if n]
+
+
+def cert_matches(sni, info):
+    """Does the presented certificate cover `sni`? None = unknown."""
+    names = _cert_names(info)
+    if not names:
+        return None
+    sni = sni.lower().rstrip(".")
+    for n in names:
+        if n == sni:
+            return True
+        if n.startswith("*.") and sni.count(".") == n.count(".") \
+                and sni.endswith(n[1:]):
+            return True
+    return False
+
+
+def _cn(cert):
+    for rdn in cert.get("subject", ()):
+        for k, v in rdn:
+            if k == "commonName":
+                return v
+    return None
+
+
+def _issuer(cert):
+    for rdn in cert.get("issuer", ()):
+        for k, v in rdn:
+            if k == "organizationName":
+                return v
+    for rdn in cert.get("issuer", ()):
+        for k, v in rdn:
+            if k == "commonName":
+                return v
+    return None
+
+
+def http_probe(host, timeout, port=80, resolve_ip=None):
+    """Fetch the block page (if any) and fingerprint it.
+
+    resolve_ip pins the connection to a specific address (e.g. the sinkhole or
+    block-page IP the local resolver returned) while keeping the Host header.
+    """
+    url = f"http://{host}/" if port == 80 else f"http://{host}:{port}/"
+    t0 = time.time()
+    pin = ["--resolve", f"{host}:{port}:{resolve_ip}"] if resolve_ip else []
+    try:
+        out = subprocess.run(
+            ["curl", "-sS", "-L", "--max-redirs", "3",
+             "--max-time", str(max(3, timeout)), *pin,
+             "-A", "Mozilla/5.0 (blockcheck)", "-o", "-", "-D", "-",
+             "-w", "\n@@@%{http_code} %{url_effective} %{remote_ip}", url],
+            capture_output=True, text=True, timeout=timeout + 4, errors="replace")
+        body = out.stdout or ""
+        meta = ""
+        if "@@@" in body:
+            body, _, meta = body.rpartition("@@@")
+        code, _, rest = meta.partition(" ")
+        eff, _, remote = rest.partition(" ")
+        # text mode normalises CRLF, so headers end at a blank \n\n
+        head, _, content = body.partition("\n\n")
+        low = content.lower()
+        hits = sorted({m for m in BLOCKPAGE_MARKERS if m in low})
+        title = ""
+        m = re.search(r"<title[^>]*>(.*?)</title>", content, re.I | re.S)
+        if m:
+            title = re.sub(r"\s+", " ", m.group(1)).strip()[:120]
+        server = ""
+        for line in head.splitlines():
+            if line.lower().startswith("server:"):
+                server = line.split(":", 1)[1].strip()
+        return {"status": code or None, "final_url": eff or url,
+                "remote_ip": remote or None, "server": server, "title": title,
+                "markers": hits, "elapsed": time.time() - t0,
+                "error": out.stderr.strip()[:160] or None,
+                "looks_like_blockpage": bool(hits) and (code in ("403", "451", "302", "200") or len(hits) > 1)}
+    except Exception as e:
+        return {"status": None, "error": f"{type(e).__name__}: {e}",
+                "elapsed": time.time() - t0, "markers": [],
+                "looks_like_blockpage": False}
+
+
+def asn_lookup(ip, timeout):
+    try:
+        out = subprocess.run(
+            ["curl", "-sS", "--max-time", str(max(3, timeout)),
+             f"https://stat.ripe.net/data/prefix-overview/data.json?resource={ip}"],
+            capture_output=True, text=True, timeout=timeout + 3)
+        js = json.loads(out.stdout)
+        d = js.get("data", {})
+        asns = d.get("asns") or []
+        return {"prefix": d.get("resource"), "asn": asns[0].get("asn") if asns else None,
+                "holder": asns[0].get("holder") if asns else None}
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# wildcard / target handling
+# --------------------------------------------------------------------------- #
+
+def normalize(raw):
+    t = raw.strip()
+    if not t or t.startswith("#"):
+        return None
+    t = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", t)
+    t = t.split("/")[0].split("?")[0].split("#")[0]
+    if "@" in t:
+        t = t.rsplit("@", 1)[1]
+    if t.count(":") == 1 and not t.startswith("[") and t.rsplit(":", 1)[1].isdigit():
+        t = t.rsplit(":", 1)[0]
+    t = t.rstrip(".").lower()
+    if t.endswith(".*"):
+        return {"raw": raw.strip(), "error": "suffix wildcards (example.*) are not supported"}
+    if t.startswith("*."):
+        base = t[2:]
+        if not base or "*" in base:
+            return {"raw": raw.strip(), "error": "invalid wildcard"}
+        return {"raw": raw.strip(), "kind": "wildcard", "base": base}
+    if "*" in t:
+        return {"raw": raw.strip(), "error": "wildcards are only supported as '*.' prefix"}
+    if not re.fullmatch(r"[a-z0-9_]([a-z0-9._-]*[a-z0-9_])?", t) or ".." in t:
+        return {"raw": raw.strip(), "error": "not a valid domain name"}
+    return {"raw": raw.strip(), "kind": "domain", "base": t}
+
+
+def rand_label(n=10, rng=None):
+    rng = rng or random
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    return "bc" + "".join(rng.choice(alphabet) for _ in range(n))
+
+
+# --------------------------------------------------------------------------- #
+# the check itself
+# --------------------------------------------------------------------------- #
+
+def check_name(name, opts, want_tls=False, want_aaaa=True):
+    """Resolve `name` across local / control / DoH (and authoritative), probe
+    the transport, and classify. Returns a report dict."""
+    qtypes = [1, 28] if want_aaaa else [1]
+    jobs = {}
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        for srv in opts.local_resolvers:
+            for qt in qtypes:
+                jobs[("local", srv, qt)] = ex.submit(_q, name, qt, srv, opts)
+        for srv in opts.control_resolvers:
+            for qt in qtypes:
+                jobs[("control", srv, qt)] = ex.submit(_q, name, qt, srv, opts)
+        if opts.doh:
+            for qt in qtypes:
+                jobs[("doh", opts.doh_provider, qt)] = ex.submit(
+                    doh_query, name, qt, opts, opts.doh_provider)
+        res = {k: f.result() for k, f in jobs.items()}
+
+    local = sorted((v for (kind, _, _), v in res.items() if kind == "local"),
+                   key=lambda m: (m["server"], m["qtype"]))
+    control = sorted((v for (kind, _, _), v in res.items() if kind == "control"),
+                     key=lambda m: (m["server"], m["qtype"]))
+    doh = sorted((v for (kind, _, _), v in res.items() if kind == "doh"),
+                 key=lambda m: (m["server"], m["qtype"]))
+    for grp, name_ in ((local, "local"), (control, "control"), (doh, "doh")):
+        for m in grp:
+            m["group"] = name_
+
+    # Ground truth per record type: DoH is hardest to intercept, then public
+    # resolvers, then whatever the local resolver says.
+    by_qtype, primary_msg = {}, None
+    for qt in qtypes:
+        chosen = None
+        for group in (doh, control, local):
+            for m in group:
+                if m["qtype"] == qt and m.get("error") is None and m.get("rcode") in (0, 3):
+                    chosen = m
+                    break
+            if chosen:
+                break
+        if not chosen:
+            continue
+        ips = ips_of(chosen)
+        by_qtype[qt] = {"ok": chosen["rcode"] == 0 and bool(ips),
+                        "rcode": chosen["rcode"], "ips": ips,
+                        "source": chosen.get("group"),
+                        "server": chosen["server"], "answer": chosen["answer"],
+                        "ad": chosen.get("ad", False), "_msg": chosen}
+        if qt == 1 or primary_msg is None:
+            primary_msg = chosen
+
+    if primary_msg is not None:
+        p = by_qtype.get(primary_msg["qtype"], {})
+        truth = {"ok": any(v["ok"] for v in by_qtype.values()),
+                 "source": p.get("source"), "server": p.get("server"),
+                 "rcode": p.get("rcode"),
+                 "ips": [i for v in by_qtype.values() for i in v["ips"]],
+                 "kinds": {ip_kind(i) for v in by_qtype.values() for i in v["ips"]},
+                 "chain": cname_chain(primary_msg), "answer": p.get("answer", []),
+                 "ad": p.get("ad", False),
+                 "by_qtype": {k: {kk: vv for kk, vv in v.items() if kk != "_msg"}
+                              for k, v in by_qtype.items()}}
+    else:
+        truth = {"ok": False, "source": None, "rcode": None, "ips": [],
+                 "kinds": set(), "chain": [], "answer": [], "ad": False,
+                 "by_qtype": {}}
+
+    for m in local + control + doh:
+        cls, note = classify_dns(m, truth)
+        m["class"], m["note"] = cls, note
+
+    # transparent port-53 interception: on-path box answers differently from DoH
+    interception53 = None
+    if truth.get("source") == "doh" and truth["ok"]:
+        for m in control:
+            b = by_qtype.get(m["qtype"])
+            if not b or m.get("error") is not None:
+                continue
+            if m.get("rcode") != b["rcode"] or (
+                    ips_of(m) and set(ips_of(m)) != set(b["ips"])
+                    and {ip_kind(i) for i in ips_of(m)} & {"sinkhole", "blockpage", "private"}):
+                interception53 = (f"public resolver {m['server']} answers "
+                                  f"{RCODE.get(m['rcode'], m['rcode'])} "
+                                  f"{', '.join(ips_of(m)) or ''} but DoH says "
+                                  f"{RCODE.get(b['rcode'], b['rcode'])} "
+                                  f"{', '.join(b['ips'])}: port 53 is intercepted on-path")
+                break
+
+    # ---- authoritative check (optional) ---------------------------------- #
+    auth = None
+    if opts.auth:
+        auth = authoritative(name, opts)
+
+    # ---- CNAME analysis -------------------------------------------------- #
+    chain = truth["chain"]
+    if not chain:
+        for m in local:
+            if m.get("class") in ("ok", "differs"):
+                chain = cname_chain(m)
+                if chain:
+                    break
+    hops = [name] + [dst for _, dst in chain]
+    cloaking = {"chain": [[a, b] for a, b in chain], "hops": hops,
+                "cross_domain": [], "tracker": None, "vendor": None,
+                "cdn": None, "first_party": False, "blocked_target": None}
+    base_reg = registrable(name)
+    for src, dst in chain:
+        if registrable(dst) != registrable(src):
+            cloaking["cross_domain"].append({"from": src, "to": dst,
+                                             "to_registrable": registrable(dst)})
+    if chain:
+        final = chain[-1][1]
+        vendor = tracker_of(final)
+        if vendor:
+            cloaking["tracker"] = final
+            cloaking["vendor"] = vendor
+            cloaking["first_party"] = registrable(name) != registrable(final)
+        elif is_cdn(final):
+            cloaking["cdn"] = final
+        # is the chain target itself filtered? (classic site-hangs symptom)
+        if opts.check_chain_targets and registrable(final) != registrable(name):
+            lo = _q(final, 1, opts.local_resolvers[0], opts)
+            tr = _q(final, 1, opts.control_resolvers[0], opts)
+            t_ok = tr.get("rcode") == 0 and bool(ips_of(tr))
+            t = {"ok": t_ok, "ips": ips_of(tr), "rcode": tr.get("rcode"),
+                 "by_qtype": {1: {"ok": t_ok, "ips": ips_of(tr),
+                                  "rcode": tr.get("rcode")}}}
+            c, note = classify_dns(lo, t)
+            if c in BLOCKING_CLASSES:
+                cloaking["blocked_target"] = {"name": final, "class": c,
+                                              "note": note or c}
+
+    # ---- transport ------------------------------------------------------- #
+    tls, http, asns = [], None, []
+    blockpage_ip = next((ip for m in local if m.get("class") == "blockpage"
+                         for ip in ips_of(m) if ip_kind(ip) == "blockpage"), None)
+    probe_ips = [i for i in truth["ips"] if ip_kind(i) == "public"] or truth["ips"]
+    v6_skipped = False
+    if any(":" in i for i in probe_ips) and not ipv6_routable(opts):
+        v6_skipped = True
+        probe_ips = [i for i in probe_ips if ":" not in i] or probe_ips
+    if want_tls and probe_ips and opts.tls:
+        seen = set()
+        cand = []
+        for ip in probe_ips:
+            if ip in seen:
+                continue
+            seen.add(ip)
+            cand.append(ip)
+            if len(cand) >= opts.max_ips:
+                break
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futs = {ex.submit(tls_probe, ip, name, opts.port, opts.timeout): ip
+                    for ip in cand}
+            tls = [f.result() for f in futs]
+        tls.sort(key=lambda r: 0 if r["status"] == "ok" else 1)
+        if opts.asn and cand:
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                asns = [a for a in ex.map(lambda i: asn_lookup(i, opts.timeout), cand[:4]) if a]
+        hs = any(r["status"] in ("ok", "cert_expired", "cert_mismatch", "cert_untrusted")
+                 for r in tls)
+        if not hs and opts.http:
+            http = http_probe(name, opts.timeout, port=opts.http_port)
+
+    # a resolver that answers with a block-page IP: fetch that page and
+    # fingerprint it, even when direct TLS to the real host works
+    if blockpage_ip and opts.http and http is None:
+        http = http_probe(name, opts.timeout, port=opts.http_port,
+                          resolve_ip=blockpage_ip)
+
+    if http and http.get("looks_like_blockpage"):
+        reasons.append("block page served"
+                       + (f" by {http['server']}" if http.get("server") else "")
+                       + (f": {http['title']}" if http.get("title") else ""))
+
+    # ---- verdict --------------------------------------------------------- #
+    reasons, paths = [], {}
+    dns_blocked = [m for m in local if m.get("class") in BLOCKING_CLASSES]
+
+    grouped = {}
+    for m in dns_blocked:
+        grouped.setdefault((m["server"], m["class"]), []).append(m["qtype_name"])
+    for (srv, cls), qts in grouped.items():
+        note = next(m["note"] for m in dns_blocked
+                    if m["server"] == srv and m["class"] == cls)
+        reasons.append(f"{srv} [{','.join(qts)}]: {note}")
+    if interception53:
+        reasons.append(interception53)
+    if truth["source"] == "doh" and dns_blocked and truth["ok"]:
+        reasons.append(f"DoH ({truth['server']}) confirms the name is live: "
+                       f"{', '.join(truth['ips'][:3])}")
+
+    tls_ok = any(r["status"] == "ok" for r in tls)
+    handshake_ok = any(r["status"] in ("ok", "cert_expired", "cert_mismatch",
+                                       "cert_untrusted") for r in tls)
+    tcp_ok = any(r.get("tcp", {}).get("ok") for r in tls)
+    sni_block = bool(tls) and tcp_ok and not handshake_ok
+    ip_block = bool(tls) and not tcp_ok
+    mismatch = any(r["status"] == "cert_mismatch" for r in tls)
+    untrusted = any(r["status"] == "cert_untrusted" for r in tls)
+    expired = any(r["status"] == "cert_expired" for r in tls)
+    interception = mismatch
+
+    if dns_blocked:
+        paths["dns"] = "filtered"
+    elif truth["ok"]:
+        paths["dns"] = "ok"
+    elif truth["rcode"] == 3:
+        paths["dns"] = "nxdomain"
+    else:
+        paths["dns"] = "unknown"
+    if tls:
+        paths["tcp"] = "open" if tcp_ok else "blocked"
+        paths["tls"] = ("ok" if tls_ok else
+                        "cert-mismatch" if mismatch else
+                        "cert-untrusted" if untrusted else
+                        "cert-expired" if expired else
+                        "sni-filtered" if sni_block else "failed")
+
+    # a failed TCP connect only means "blocked" if the network works at all
+    egress_ok = True
+    if ip_block:
+        egress_ok = ensure_baseline(opts)
+        if not egress_ok:
+            paths["tcp"] = "unreachable"
+            paths["tls"] = "n/a"
+
+    blocked = bool(dns_blocked) or (ip_block and egress_ok) or sni_block or interception
+    if blocked:
+        verdict = "BLOCKED"
+    elif truth["ok"]:
+        verdict = "ALLOWED"
+    else:
+        verdict = "UNKNOWN"
+
+    if ip_block and egress_ok:
+        reasons.append("TCP connect fails to every resolved address "
+                       "(IP/port block, or the host is down)")
+    if ip_block and not egress_ok:
+        reasons.append("no outbound TCP/443 at all from this network: "
+                       "cannot tell a block from a broken uplink")
+    if sni_block:
+        reasons.append("TCP connects but TLS fails for this SNI "
+                       "(SNI-based filtering or reset)")
+    if interception:
+        reasons.append("certificate is for a different name: MITM or block portal")
+    if untrusted:
+        reasons.append("certificate is not trusted (self-signed or an "
+                       "inspection CA): possible TLS interception")
+    if expired:
+        reasons.append("certificate expired: the site's own problem, not a block")
+    if dns_blocked and tls_ok:
+        reasons.append("direct IP connectivity still works: DNS-only block, "
+                       "reachable via DoH or a different resolver")
+    if v6_skipped:
+        paths["ipv6"] = "unreachable"
+    if truth["rcode"] == 3 and not dns_blocked:
+        reasons.append("NXDOMAIN from every resolver: name does not exist "
+                       "(not a block)")
+
+    return {"name": name, "verdict": verdict, "blocked": blocked,
+            "reasons": reasons, "paths": paths, "truth": truth,
+            "local": local, "control": control, "doh": doh, "auth": auth,
+            "cloaking": cloaking, "tls": tls, "http": http, "asn": asns,
+            "timing": {"checked": time.strftime("%Y-%m-%dT%H:%M:%S%z")}}
+
+
+def ensure_baseline(opts):
+    """Is outbound 443 working at all here? Cached per run."""
+    if getattr(opts, "_baseline", None) is None:
+        opts._baseline = any(tcp_probe(ip, 443, min(3.0, opts.timeout))["ok"]
+                             for ip in ("1.1.1.1", "8.8.8.8", "9.9.9.9"))
+    return opts._baseline
+
+
+def authoritative(name, opts):
+    """Ask the zone's own nameservers, bypassing every recursive resolver."""
+    labels = name.split(".")
+    ns_names, zone = [], name
+    for i in range(len(labels)):
+        cand = ".".join(labels[i:])
+        r = _q(cand, 2, opts.control_resolvers[0], opts, rd=True)
+        ns = [a["data"] for a in r.get("answer", []) if a["type"] == 2]
+        if ns:
+            ns_names, zone = ns, cand
+            break
+    if not ns_names:
+        return {"error": "could not find NS for any parent zone"}
+    ips = []
+    for ns in ns_names[:4]:
+        r = _q(ns.rstrip("."), 1, opts.control_resolvers[0], opts)
+        ips += ips_of(r)
+    if not ips:
+        return {"error": f"could not resolve NS addresses ({', '.join(ns_names[:3])})"}
+    out = {"zone": zone, "ns": ns_names[:4], "answers": []}
+    for ip in ips[:3]:
+        r = _q(name, 1, (ip, 53), opts, rd=False)
+        r["class"], r["note"] = classify_dns(r, {"ok": False, "ips": [], "kinds": set()})
+        out["answers"].append(r)
+    return out
+
+
+def check_target(target, opts):
+    """target: normalized dict. Handles wildcard expansion + samples."""
+    if target.get("error"):
+        return {"target": target["raw"], "kind": "invalid", "verdict": "ERROR",
+                "blocked": False, "reasons": [target["error"]], "error": target["error"]}
+
+    if target["kind"] == "domain":
+        rep = check_name(target["base"], opts, want_tls=True)
+        rep.update({"target": target["base"], "raw": target["raw"],
+                    "kind": "domain"})
+        return rep
+
+    # wildcard: full check of the apex, then N random subdomains (DNS only)
+    base = target["base"]
+    apex = check_name(base, opts, want_tls=True)
+    rng = random.Random(opts.seed) if opts.seed is not None else random
+    samples = [f"{rand_label(10, rng)}.{base}" for _ in range(opts.samples)]
+    rows = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {}
+        for s in samples:
+            futs[(s, "local")] = ex.submit(_q, s, 1, opts.local_resolvers[0], opts)
+            futs[(s, "truth")] = ex.submit(_q, s, 1, opts.control_resolvers[0], opts)
+        for s in samples:
+            lo = futs[(s, "local")].result()
+            tr = futs[(s, "truth")].result()
+            truth_like = {"ok": bool(ips_of(tr)), "rcode": tr.get("rcode"),
+                          "ips": ips_of(tr),
+                          "kinds": {ip_kind(i) for i in ips_of(tr)}}
+            cls, note = classify_dns(lo, truth_like)
+            rows.append({"name": s, "class": cls, "note": note,
+                         "local_ips": ips_of(lo), "public_ips": ips_of(tr),
+                         "public_rcode": RCODE.get(tr.get("rcode"), tr.get("rcode")),
+                         "public_wildcard": bool(ips_of(tr))})
+
+    # only samples that actually resolve locally can "leak"; a name that
+    # resolves nowhere is not a hole in the rule
+    resolvable = [r for r in rows if r["local_ips"]]
+    leaks = [r for r in resolvable if r["class"] not in BLOCKING_CLASSES]
+    blocked_s = [r for r in resolvable if r["class"] in BLOCKING_CLASSES]
+
+    reasons = list(apex["reasons"])
+    if not rows:
+        wc_verdict = apex["verdict"]
+    elif leaks:
+        wc_verdict = "PARTIAL"
+        reasons.append(f"wildcard leak: {leaks[0]['name']} is not filtered "
+                       f"({', '.join(leaks[0]['local_ips'])})")
+    elif blocked_s:
+        wc_verdict = "BLOCKED"
+        reasons.append(f"all {len(blocked_s)} randomly named subdomains are "
+                       f"filtered as well")
+    else:
+        wc_verdict = apex["verdict"]
+        reasons.append("the zone publishes no wildcard address records, so a "
+                       "'*.' rule has nothing extra to cover beyond the apex")
+
+    apex.update({"target": target["base"], "raw": target["raw"],
+                 "kind": "wildcard", "base": base,
+                 "samples": rows, "verdict": wc_verdict,
+                 "blocked": wc_verdict == "BLOCKED",
+                 "reasons": reasons})
+    return apex
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+
+VERDICT_COLOR = {"BLOCKED": C.red, "ALLOWED": C.green, "PARTIAL": C.yellow,
+                 "UNKNOWN": C.dim, "ERROR": C.mag}
+
+
+def badge(v):
+    return VERDICT_COLOR.get(v, C.bold)(v)
+
+
+def fmt_answer(m):
+    if m.get("error"):
+        return f"no reply ({trunc(m['error'], 40)})"
+    rc = RCODE.get(m.get("rcode"), m.get("rcode"))
+    ips = ips_of(m)
+    if m.get("rcode") == 0 and not ips:
+        return "NOERROR (no address)"
+    if ips:
+        extra = ""
+        if len(ips) > 4:
+            extra = f" +{len(ips) - 4}"
+        return f"{rc} {', '.join(ips[:4])}{extra}"
+    return str(rc)
+
+
+def fmt_cert(r):
+    bits = []
+    if r.get("cert_subject"):
+        bits.append(f"cert={r['cert_subject']}")
+    if r.get("cert_issuer"):
+        bits.append(f"issuer={r['cert_issuer']}")
+    elif r.get("issuer"):
+        bits.append(f"issuer={trunc(r['issuer'], 48)}")
+    if r.get("not_after"):
+        bits.append(f"exp={r['not_after']}")
+    if r.get("alpn"):
+        bits.append(f"alpn={r['alpn']}")
+    return " ".join(bits)
+
+
+def render(rep, opts):
+    if opts.json:
+        return
+    print()
+    print(f"{C.bold(rep.get('target', '?'))}  {badge(rep['verdict'])}"
+          + (f"  {C.dim('[' + rep['kind'] + ']')}" if rep.get("kind") else ""))
+    if rep.get("error"):
+        print(f"  {C.red(rep['error'])}")
+        return
+
+    p = rep.get("paths", {})
+    path_line = "  ".join(f"{k}: {v}" for k, v in
+                          (("dns", p.get("dns")), ("tcp", p.get("tcp")),
+                           ("tls", p.get("tls")), ("ipv6", p.get("ipv6")))
+                          if v)
+    if path_line:
+        print(f"  {C.dim('path')}      {path_line}")
+
+    for r in rep.get("reasons", []):
+        print(f"  {C.dim('reason')}    {r}")
+
+    # dns block
+    t = rep.get("truth", {})
+    print(f"  {C.dim('truth')}     {t.get('source') or '-'} "
+          f"({t.get('server') or '-'}) -> "
+          f"{', '.join(t.get('ips', [])[:4]) or RCODE.get(t.get('rcode'), 'none')}"
+          + (f"  {C.dim('ad=' + str(t.get('ad')))}" if t.get("ad") else ""))
+    for label, group in (("local", rep.get("local", [])),
+                         ("control", rep.get("control", [])),
+                         ("doh", rep.get("doh", []))):
+        shown = 0
+        for m in group:
+            # non-verbose: one representative line per server+record type
+            if not opts.verbose and label != "local" and shown >= 2:
+                continue
+            if not opts.verbose and label != "local" and m.get("error"):
+                continue
+            if not opts.verbose and label != "local" and m.get("class") == "differs" and shown >= 1:
+                continue
+            mark = C.red("!") if (label == "local" and m.get("class") in BLOCKING_CLASSES) else " "
+            print(f"  {mark} {label:<8} {m['server']:<15} {m['qtype_name']:<4} "
+                  f"{fmt_answer(m):<40} {C.dim(dur(m['elapsed']) + '  ' + m['class'])}")
+            shown += 1
+        if not opts.verbose and label != "local" and group and shown == 0:
+            print(f"    {C.dim(label + '     no usable answer from ' + ', '.join(sorted({m['server'] for m in group})))}")
+    auth = rep.get("auth")
+    if auth and not auth.get("error"):
+        for m in auth["answers"]:
+            print(f"    {'auth':<8} {m['server']:<15} {m['qtype_name']:<4} "
+                  f"{fmt_answer(m):<40} {C.dim(dur(m['elapsed']) + ('  AA' if m.get('aa') else ''))}")
+    elif auth and auth.get("error"):
+        print(f"    {C.dim('auth     ' + auth['error'])}")
+
+    # cname
+    ck = rep.get("cloaking", {})
+    if ck.get("chain"):
+        print(f"  {C.dim('cname')}     " + " -> ".join(ck["hops"]))
+        for hop in ck.get("cross_domain", []):
+            tag = C.yellow("cross-domain")
+            print(f"            {tag} {hop['from']} -> {hop['to']} ({hop['to_registrable']})")
+        if ck.get("vendor"):
+            label = "CNAME CLOAKING (first-party disguise)" if ck.get("first_party") else "third-party tracker"
+            print(f"            {C.mag(label)}: {ck['tracker']} = {ck['vendor']}")
+        elif ck.get("cdn"):
+            print(f"            {C.dim('CDN edge: ' + ck['cdn'])}")
+        if ck.get("blocked_target"):
+            bt = ck["blocked_target"]
+            print(f"            {C.red('chain target filtered')}: {bt['name']} ({bt['class']}) "
+                  f"- the site will hang or break")
+    else:
+        print(f"  {C.dim('cname')}     -")
+
+    # transport
+    for r in rep.get("tls", []):
+        st = r["status"]
+        col = (C.green if st == "ok" else
+               C.red if st in ("cert_mismatch", "tcp_fail", "tls_reset") else
+               C.yellow if st.startswith("cert_") else C.red)
+        head = f"{r['ip']}:{r['port']}"
+        if st == "ok":
+            line = f"ok  {r.get('tls')}  {fmt_cert(r)}  {C.dim(dur(r.get('elapsed', 0)))}"
+        elif st.startswith("cert_"):
+            line = f"{st}: {trunc(r.get('verify_error', ''), 70)}  {fmt_cert(r)}"
+        elif st == "tcp_fail":
+            line = f"TCP failed: {r['tcp'].get('error')}"
+        else:
+            line = f"{st}: {trunc(r.get('error', ''), 70)}"
+        print(f"  {C.dim('tls')}       {head:<22} {col(line)}")
+    if rep.get("http"):
+        h = rep["http"]
+        if h.get("looks_like_blockpage"):
+            print(f"  {C.red('blockpage')} {h.get('status')} {trunc(h.get('final_url'), 60)} "
+                  f"server={h.get('server')} title={trunc(h.get('title'), 50)!r} "
+                  f"markers={','.join(h.get('markers', [])[:4])}")
+        else:
+            print(f"  {C.dim('http')}      {h.get('status')} {trunc(h.get('final_url'), 60)} "
+                  f"{('title=' + trunc(h.get('title'), 40)) if h.get('title') else ''}")
+    if rep.get("asn"):
+        for a in rep["asn"]:
+            print(f"  {C.dim('asn')}       {a.get('prefix')} AS{a.get('asn')} {trunc(a.get('holder'), 50)}")
+
+    # wildcard samples
+    for s in rep.get("samples", []):
+        mark = C.red("!") if s["class"] in BLOCKING_CLASSES else C.yellow("?")
+        print(f"  {mark} {C.dim('sample')}   {s['name']:<38} {s['class']:<10} "
+              f"local={','.join(s['local_ips']) or '-'} public={','.join(s['public_ips']) or s['public_rcode']}")
+
+
+def print_table(reps, opts):
+    if opts.json or (len(reps) < 2 and not opts.brief) or opts.verbose:
+        return
+
+    def pad(s, w):
+        s = str(s)
+        return s + " " * max(0, w - len(s))
+
+    print()
+    w = max((len(r.get("target", "")) for r in reps), default=10)
+    w = max(w, 6)
+    print(f"{C.dim(pad('TARGET', w))}  {C.dim(pad('VERDICT', 9))} "
+          f"{C.dim(pad('DNS', 11))} {C.dim(pad('TLS', 13))} {C.dim('NOTE')}")
+    for r in reps:
+        tgt = r.get("target", "")
+        if r.get("error"):
+            print(f"{pad(tgt, w)}  {badge(pad('ERROR', 9))} {pad('-', 11)} "
+                  f"{pad('-', 13)} {r['error']}")
+            continue
+        p = r.get("paths", {})
+        note = (r.get("reasons") or [""])[0]
+        if not note:
+            ips = r.get("truth", {}).get("ips") or []
+            note = ("resolves " + ", ".join(ips[:2])) if ips else "no findings"
+        print(f"{pad(tgt, w)}  {badge(pad(r['verdict'], 9))} "
+              f"{pad(p.get('dns', '-'), 11)} {pad(p.get('tls', '-'), 13)} "
+              f"{trunc(note, 80)}")
+
+
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
+
+def read_resolv_conf():
+    out = []
+    try:
+        with open("/etc/resolv.conf", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.split("#")[0].strip()
+                if line.lower().startswith("nameserver"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        out.append(parts[1])
+    except OSError:
+        pass
+    return out or ["127.0.0.1"]
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="blockcheck",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Check whether a domain or *.wildcard is actually blocked, and where.",
+        epilog="""examples:
+  blockcheck example.com
+  blockcheck '*.doubleclick.net' --auth
+  blockcheck -f domains.txt --json > report.json
+  blockcheck ads.site.com --resolver 192.168.31.1:53 --timeout 3
+  blockcheck example.com -v --asn
+
+exit codes: 0 allowed, 2 blocked, 3 partial/unknown, 1 error""")
+    p.add_argument("targets", nargs="*", help="domain, URL, or *.wildcard (use '-' for stdin)")
+    p.add_argument("-f", "--file", help="read targets from file (one per line, # comments)")
+    p.add_argument("-r", "--resolver", action="append", default=[],
+                   help="resolver to test (ip[:port], repeatable); default: /etc/resolv.conf")
+    p.add_argument("--control", action="append", default=[],
+                   help="public resolver used as ground truth (repeatable)")
+    p.add_argument("-t", "--timeout", type=float, default=4.0, help="per-probe timeout, s (default 4)")
+    p.add_argument("--retries", type=int, default=1, help="DNS retries per server (default 1)")
+    p.add_argument("--port", type=int, default=443, help="TLS port to probe (default 443)")
+    p.add_argument("--http-port", type=int, default=80,
+                   help="port used to fetch a block page (default 80)")
+    p.add_argument("--max-ips", type=int, default=3, help="addresses to probe per name (default 3)")
+    p.add_argument("--samples", type=int, default=3, help="random subdomains per wildcard (default 3)")
+    p.add_argument("--seed", type=int, help="seed for wildcard samples (reproducible runs)")
+    p.add_argument("--no-doh", dest="doh", action="store_false", help="skip DoH ground truth")
+    p.add_argument("--dnssec", action="store_true",
+                   help="set the EDNS0 DO bit (note: some middleboxes drop such queries)")
+    p.add_argument("--doh-provider", default=None, help="cloudflare|google (default: try both)")
+    p.add_argument("--no-tls", dest="tls", action="store_false", help="DNS-only check")
+    p.add_argument("--no-http", dest="http", action="store_false", help="skip block-page fetch")
+    p.add_argument("--no-chain-check", dest="check_chain_targets", action="store_false",
+                   help="do not test whether CNAME targets are themselves blocked")
+    p.add_argument("--auth", action="store_true", help="also query the zone's authoritative NS")
+    p.add_argument("--asn", action="store_true", help="look up ASN/prefix for resolved IPs (RDAP)")
+    p.add_argument("-v", "--verbose", action="store_true", help="show every resolver answer")
+    p.add_argument("--brief", action="store_true", help="summary table only")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--quiet", action="store_true", help="no output, exit code only")
+    p.add_argument("--no-color", action="store_true", help="disable ANSI colour")
+    p.add_argument("--version", action="version", version=f"blockcheck {VERSION}")
+    return p
+
+
+def main(argv):
+    opts = build_parser().parse_args(argv)
+    if opts.no_color or opts.json:
+        C.on = False
+
+    raw = list(opts.targets)
+    if opts.file:
+        try:
+            with open(opts.file, encoding="utf-8", errors="replace") as f:
+                raw += [ln.strip() for ln in f]
+        except OSError as e:
+            print(f"blockcheck: cannot read {opts.file}: {e}", file=sys.stderr)
+            return 1
+    if "-" in raw:
+        raw = [x for x in raw if x != "-"] + [ln.strip() for ln in sys.stdin]
+
+    targets = [n for n in (normalize(r) for r in raw) if n]
+    if not targets:
+        build_parser().print_help()
+        return 1
+
+    opts.local_resolvers = [parse_server(r) for r in opts.resolver] or \
+                           [parse_server(r) for r in read_resolv_conf()]
+    opts.control_resolvers = opts.control or ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+
+    if shutil.which("curl") is None:
+        opts.doh = opts.http = opts.asn = False
+        if not opts.json and not opts.quiet:
+            print("blockcheck: curl not found - DoH, block-page and ASN checks "
+                  "disabled", file=sys.stderr)
+    if len(targets) == 1:
+        reps = [check_target(targets[0], opts)]
+    else:
+        with ThreadPoolExecutor(max_workers=min(3, len(targets))) as ex:
+            reps = list(ex.map(lambda t: check_target(t, opts), targets))
+
+    if opts.json:
+        doc = {"tool": "blockcheck", "version": VERSION,
+               "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+               "config": {"local_resolvers": [f"{h}:{p}" for h, p in
+                                               opts.local_resolvers],
+                          "control_resolvers": opts.control_resolvers,
+                          "doh": opts.doh, "timeout": opts.timeout},
+               "targets": [jsonable(r) for r in reps],
+               "summary": {"total": len(reps),
+                           "blocked": sum(1 for r in reps if r["verdict"] == "BLOCKED"),
+                           "allowed": sum(1 for r in reps if r["verdict"] == "ALLOWED"),
+                           "partial": sum(1 for r in reps if r["verdict"] == "PARTIAL"),
+                           "unknown": sum(1 for r in reps if r["verdict"] in ("UNKNOWN", "ERROR"))}}
+        print(json.dumps(doc, indent=2, default=str))
+    elif not opts.quiet:
+        if not opts.brief:
+            for r in reps:
+                render(r, opts)
+        print_table(reps, opts)
+        if len(reps) > 1 and not opts.brief:
+            b = sum(1 for r in reps if r["verdict"] == "BLOCKED")
+            print(f"\n{C.dim(f'{len(reps)} checked, {b} blocked')}")
+
+    if any(r["verdict"] == "ERROR" for r in reps):
+        return 1
+    if any(r["verdict"] == "BLOCKED" for r in reps):
+        return 2
+    if any(r["verdict"] in ("PARTIAL", "UNKNOWN") for r in reps):
+        return 3
+    return 0
+
+
+def jsonable(o):
+    if isinstance(o, set):
+        return sorted(o)
+    if isinstance(o, dict):
+        return {k: jsonable(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [jsonable(v) for v in o]
+    return o
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
